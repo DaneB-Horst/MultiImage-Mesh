@@ -1,0 +1,251 @@
+
+import bpy
+import os
+from bpy.props import StringProperty, CollectionProperty, IntProperty
+from bpy_extras.io_utils import ImportHelper
+from bpy.types import Operator
+from bpy_extras.io_utils import ImportHelper
+from bpy.types import OperatorFileListElement
+
+
+class IMPORT_OT_multiple_images_as_mesh(Operator, ImportHelper):
+    """Import multiple images as individual mesh planes"""
+
+    bl_idname = "import_scene.multiple_images_as_mesh"
+    bl_label = "Import Multiple Images as Meshes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    directory: StringProperty(
+    subtype='DIR_PATH'
+)
+
+    filename_ext = ""
+
+    filter_glob: StringProperty(
+        default="*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp;*.webp",
+        options={'HIDDEN'}
+    )
+
+    files: CollectionProperty(
+        type=OperatorFileListElement,
+        options={'HIDDEN', 'SKIP_SAVE'}
+    )
+
+    columns: IntProperty(
+        name="Columns",
+        description="Number of images per row",
+        default=5,
+        min=1,
+        max=50
+    )
+
+    image_size: bpy.props.FloatProperty(
+        name="Maximum Image Size",
+        description="Maximum width or height of each plane",
+        default=2.5,
+        min=0.1
+    )
+
+    spacing: bpy.props.FloatProperty(
+        name="Spacing",
+        description="Distance between image planes",
+        default=3.5,
+        min=0.1
+    )
+
+    def execute(self, context):
+
+        # Create or find collection
+        collection_name = "Imported Image Meshes"
+
+        collection = bpy.data.collections.get(collection_name)
+
+        if collection is None:
+            collection = bpy.data.collections.new(collection_name)
+            context.scene.collection.children.link(collection)
+
+        imported = []
+
+        # Get selected image files
+        file_paths = [
+            os.path.join(self.directory, f.name)
+            for f in self.files
+        ]
+
+        # Support single-file selection as well
+        if not file_paths and self.filepath:
+            file_paths.append(self.filepath)
+
+        if not file_paths:
+            self.report({'WARNING'}, "No images selected")
+            return {'CANCELLED'}
+
+        for path in file_paths:
+
+            try:
+                # Load image
+                image = bpy.data.images.load(
+                    path,
+                    check_existing=True
+                )
+
+                width, height = image.size
+
+                if width == 0 or height == 0:
+                    continue
+
+                # Calculate aspect ratio
+                aspect = width / height
+
+                if aspect >= 1:
+                    plane_width = self.image_size
+                    plane_height = self.image_size / aspect
+                else:
+                    plane_height = self.image_size
+                    plane_width = self.image_size * aspect
+
+                # Create plane mesh
+                verts = [
+                    (-plane_width / 2, -plane_height / 2, 0),
+                    ( plane_width / 2, -plane_height / 2, 0),
+                    ( plane_width / 2,  plane_height / 2, 0),
+                    (-plane_width / 2,  plane_height / 2, 0)
+                ]
+
+                faces = [(0, 1, 2, 3)]
+
+                mesh = bpy.data.meshes.new(
+                    os.path.splitext(os.path.basename(path))[0]
+                )
+
+                mesh.from_pydata(verts, [], faces)
+                mesh.update()
+
+                # UV coordinates
+                uv_layer = mesh.uv_layers.new(name="UVMap")
+
+                uv_coords = [
+                    (0, 0),
+                    (1, 0),
+                    (1, 1),
+                    (0, 1)
+                ]
+
+                for loop in mesh.loops:
+                    uv_layer.data[loop.index].uv = uv_coords[loop.vertex_index]
+
+                # Create object
+                obj_name = os.path.splitext(
+                    os.path.basename(path)
+                )[0]
+
+                obj = bpy.data.objects.new(obj_name, mesh)
+                collection.objects.link(obj)
+
+                # Create material
+                mat = bpy.data.materials.new(
+                    name=obj_name + "_Material"
+                )
+
+                mat.use_nodes = True
+
+                nodes = mat.node_tree.nodes
+                links = mat.node_tree.links
+
+                nodes.clear()
+
+                output = nodes.new("ShaderNodeOutputMaterial")
+                output.location = (400, 0)
+
+                principled = nodes.new("ShaderNodeBsdfPrincipled")
+                principled.location = (100, 0)
+
+                texture = nodes.new("ShaderNodeTexImage")
+                texture.location = (-250, 0)
+                texture.image = image
+                texture.interpolation = 'Linear'
+
+                # Connect image colour and transparency
+                links.new(
+                    texture.outputs["Color"],
+                    principled.inputs["Base Color"]
+                )
+
+                links.new(
+                    texture.outputs["Alpha"],
+                    principled.inputs["Alpha"]
+                )
+
+                links.new(
+                    principled.outputs["BSDF"],
+                    output.inputs["Surface"]
+                )
+
+                # Transparency settings
+                try:
+                    mat.surface_render_method = 'DITHERED'
+                except AttributeError:
+                    mat.blend_method = 'BLEND'
+
+                # Assign material
+                mesh.materials.append(mat)
+
+                # Store object and dimensions
+                imported.append(
+                    (obj, plane_width, plane_height)
+                )
+
+            except Exception as e:
+                print("Could not import:", path, e)
+
+        # Arrange images in a grid
+        for index, item in enumerate(imported):
+
+            obj, plane_width, plane_height = item
+
+            col = index % self.columns
+            row = index // self.columns
+
+            obj.location = (
+                col * self.spacing,
+                -row * self.spacing,
+                0
+            )
+
+        # Select imported objects
+        bpy.ops.object.select_all(action='DESELECT')
+
+        for item in imported:
+            item[0].select_set(True)
+
+        if imported:
+            context.view_layer.objects.active = imported[0][0]
+
+        self.report(
+            {'INFO'},
+            f"Imported {len(imported)} image mesh objects"
+        )
+
+        return {'FINISHED'}
+
+
+def menu_func(self, context):
+    self.layout.operator(
+        IMPORT_OT_multiple_images_as_mesh.bl_idname,
+        text="Multiple Images as Meshes"
+    )
+
+
+def register():
+    bpy.utils.register_class(IMPORT_OT_multiple_images_as_mesh)
+    bpy.types.TOPBAR_MT_file_import.append(menu_func)
+
+
+def unregister():
+    bpy.types.TOPBAR_MT_file_import.remove(menu_func)
+    bpy.utils.unregister_class(IMPORT_OT_multiple_images_as_mesh)
+
+
+if __name__ == "__main__":
+    register()
+    bpy.ops.import_scene.multiple_images_as_mesh('INVOKE_DEFAULT')
